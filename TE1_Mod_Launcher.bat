@@ -161,6 +161,13 @@ rem ----------------------------------------------------------------------
 #   --apply           install enabled mods into Data\ and exit
 #   --restore         put the original Data\*.dat files back and exit
 #   --status          print what is installed and exit
+#   --verify          read Data\*.dat and the executables the way the game
+#                     does and name anything damaged (preflight before play)
+#   --check-exe PATH  say whether an executable (or a renamed .txt copy of
+#                     one) is intact and whether the mod is inside it
+#   --revert-exe      put the original game executables back and switch
+#                     Guard Key Names off (the way out when a patched exe
+#                     does not start)
 #   --report          dry run of "Better Translate", print the diff, exit
 #   --handover SEC    wait this long for the real game to appear after the
 #                     front-end closed (default 8)
@@ -183,7 +190,7 @@ import time
 import zlib
 from pathlib import Path
 
-ENGINE_VERSION = "1.1"
+ENGINE_VERSION = "1.2"
 EXE_NAME = "TheEscapists.exe"
 
 # Language files the two mods touch.
@@ -843,6 +850,69 @@ def rebuild_val(data_dir):
     return changed
 
 
+def verify_data(data_dir):
+    """Read every Data\\*.dat the way the game will, before it does.
+
+    -> (problems, lines). The game loads these files at start-up, so a
+    half-written file (a crash, a full disk, an antivirus that "repaired"
+    it) or a val.dat that no longer matches the sizes is exactly what makes
+    the game flash and vanish. Called before every launch.
+    """
+    data_dir = Path(data_dir)
+    problems, lines = [], []
+    known = set("%s_%s.dat" % (kind, lang)
+                for lang in LANGS.values() for kind in KINDS)
+    for f in sorted(data_dir.glob("*.dat")):
+        if f.name.lower() == "val.dat":
+            continue
+        try:
+            raw = f.read_bytes()
+        except OSError as e:
+            problems.append("%s: %s" % (f.name, e))
+            continue
+        text, enc, bom = decode_dat(raw)
+        if text is None:
+            if f.name in known:
+                problems.append("%s: unreadable - the game cannot load it"
+                                % f.name)
+            else:
+                lines.append("%-20s skipped (not a text file)" % f.name)
+            continue
+        try:
+            back, _e2, _b2 = decode_dat(encode_dat(text, enc, bom))
+        except Exception as e:
+            back = "error: %s" % e
+        if back != text:
+            problems.append("%s: re-encoding does not round-trip (%s)"
+                            % (f.name, back if isinstance(back, str)
+                               else "content changed"))
+        else:
+            lines.append("%-20s ok (%s, %d bytes)" % (f.name, enc, len(raw)))
+    vpath = data_dir / "val.dat"
+    if vpath.exists():
+        try:
+            txt = vpath.read_bytes().decode("utf-16-le", "replace")
+            bad = 0
+            for letter, lang in LANGS.items():
+                m = re.search(r"(^|\n)(%s=)([0-9a-f]{32})_([0-9a-f]{32})_"
+                              r"([0-9a-f]{32})" % letter, txt)
+                if not m:
+                    continue
+                toks = [m.group(3), m.group(4), m.group(5)]
+                for i, kind in enumerate(KINDS):
+                    fp = data_dir / ("%s_%s.dat" % (kind, lang))
+                    if fp.exists() and toks[i] != md5_size(fp.stat().st_size):
+                        bad += 1
+            if bad:
+                problems.append("val.dat: %d size(s) do not match the files "
+                                "on disk (run --apply to rebuild it)" % bad)
+            else:
+                lines.append("%-20s ok (matches the file sizes)" % "val.dat")
+        except Exception as e:
+            problems.append("val.dat: %s" % e)
+    return problems, lines
+
+
 # ------------------------------------------------------- generic RU clean-up
 CYR_LOW = "\u0430\u0431\u0432\u0433\u0434\u0435\u0451\u0436\u0437\u0438\u0439\u043a\u043b\u043c\u043d\u043e\u043f\u0440\u0441\u0442\u0443\u0444\u0445\u0446\u0447\u0448\u0449\u044a\u044b\u044c\u044d\u044e\u044f"
 
@@ -940,6 +1010,7 @@ GK_JUMP_TARGET = 5                             # frame id the start click jumps 
 GK_ACT = (36, 88)                              # "Named Variable Object": set string
 GK_JUMP_PREFIX = bytes.fromhex("08001a00")     # param: u16 size=8, i16 code=0x1a
 GK_MAGIC = 54
+GK_GROWTH = 112                # bytes the five officer names add to the exe
 
 
 class GkSkip(Exception):
@@ -1576,12 +1647,219 @@ def sha1_and_size(path):
         return None, None
 
 
+# ------------------------------------------------- what is this file, really?
+# sha1 of the executables that have been checked by hand: the untouched
+# game files and the patched ones that are known to be good. This is only a
+# convenience label ("we have seen this exact file before"): a build from
+# another Steam/GOG depot, or one patched by a Python with a different zlib
+# (the patched exe is 7 bytes longer - same content, other compression),
+# simply prints "not in our list", which never means "broken". The
+# structural check is the one that decides.
+KNOWN_EXE = {
+    # stock: the game files as shipped, the mod is not inside
+    "cf7b416ca19572edee37f3eb30f18d54e39fc279":
+        ("TheEscapists_eur.exe", "stock"),
+    "fd8f022aba53f7c84256575a60cb5cfca7eee36c":
+        ("TheEscapists_pol.exe", "stock"),
+    "d8e5dec339ec546977f69471402e7c169516c128":
+        ("TheEscapists_rus.exe", "stock"),
+    # patched: the reference build (pristine size + 112 bytes, the size the
+    # events take) and the same mod written by another zlib
+    "86f9d274e2aa9786c318cc08fc70de4fe2b2d2d5":
+        ("TheEscapists_eur.exe", "patched"),
+    "70581800f8e8bd86712d187e93e9e3aae0d9dcd4":
+        ("TheEscapists_pol.exe", "patched"),
+    "5719956d044e07215cbaeec40d7c9a82fe966bab":
+        ("TheEscapists_rus.exe", "patched"),
+    "9f2c6105e0034edd07aeff22defb710108b87e86":
+        ("TheEscapists_eur.exe", "patched"),
+    "c431867be5e0dbeefe8ce5ad63b6227caeb69236":
+        ("TheEscapists_pol.exe", "patched"),
+    "c32351fc6d0e4e5040f2ffd30980d6532af05d57":
+        ("TheEscapists_rus.exe", "patched"),
+}
+
+
+def gk_names_in_groups(groups):
+    """-> {variable: label} for the officer names the mod writes, or {}."""
+    try:
+        start = gk_find_start_group(groups)
+    except Exception:
+        return {}
+    found = {}
+    for a in start["acts"]:
+        if len(a) < 6:
+            continue
+        _ot, num = struct.unpack_from("<hh", a, 2)
+        if num != GK_ACT[1]:
+            continue
+        prs = gk_act_params(a)
+        if len(prs) != 2:
+            continue
+        s0 = gk_iter_strings(prs[0])
+        s1 = gk_iter_strings(prs[1])
+        if s0 and s0[0].startswith("GuardName_"):
+            found[s0[0]] = s1[0] if s1 else None
+    return found
+
+
+def gk_exe_verdict(path):
+    """Look at one executable and say what it is.
+
+    -> (verdict, headline, notes)
+
+    verdict  : patched / stock / unsupported / damaged / missing
+    headline : one line, printed by --status and --check-exe
+    notes    : extra lines (size, sha1, what to do) for --check-exe
+
+    The point of this function is the question players ask when the game
+    stops starting: "did the mod break my exe?". It answers with the file
+    itself, so it works on a copy, on a renamed .txt dump, on anything.
+    """
+    p = Path(path)
+    size, digest = sha1_and_size(p)
+    if size is None:
+        return ("missing",
+                "MISSING - the file is not there any more",
+                ["the game cannot start without it: in Steam, right-click",
+                 "the game -> Properties -> Installed Files ->",
+                 "Verify integrity of game files"])
+    notes = []
+    if size is not None:
+        notes.append("size : %d bytes" % size)
+        notes.append("sha1 : %s" % digest)
+    label, kind = KNOWN_EXE.get(digest, (None, None))
+    if kind == "patched":
+        notes.append("known: a patched %s we have already checked (this is"
+                     " the mod)" % label)
+        notes.append("       (the patch only adds the events, %d bytes; a"
+                     " longer file is normal)" % GK_GROWTH)
+    elif kind == "stock":
+        notes.append("known: the untouched %s as shipped - no mod inside"
+                     % label)
+    else:
+        notes.append("known: not one of the files we have on record (other"
+                     " depot or another zlib - not an error)")
+    front = p.name.lower() == EXE_NAME.lower()
+    try:
+        state = gk_exe_state(p)
+    except Exception:
+        state = "unreadable"
+    if state == "patched":
+        names = {}
+        try:
+            _off, chunks, cipher = xf_parse(p.read_bytes())
+            _fi, _subs, events = gk_frame_events(chunks, cipher, GK_FRAME)
+            names = gk_names_in_groups(gk_walk_events(events)["groups"])
+        except Exception:
+            names = {}
+        want = dict(("GuardName_%d" % i, GK_NAMES[i - 1])
+                    for i in range(1, 6))
+        if names == want:
+            notes.append("officers renamed: " + ", ".join(GK_NAMES))
+        elif names:
+            notes.append("officer names found: "
+                         + ", ".join(sorted(v for v in names.values() if v)))
+        headline = ("VALID - the Guard Key patch is inside and the whole "
+                    "file parses cleanly")
+        notes.append("Nothing in a file like this can stop the game from")
+        notes.append("starting: the mod only renames five officers.")
+        return "patched", headline, notes
+    if state == "clean":
+        return ("stock",
+                "OK - the original executable, the mod is NOT installed",
+                notes)
+    if state == "unsupported":
+        if front:
+            return ("unsupported",
+                    "OK - the small front end, it never takes this mod "
+                    "(normal)",
+                    notes + ["The patch lives in the 8 MB "
+                             "theescapists_<lang>.exe next to it."])
+        return ("unsupported",
+                "OK - the file is intact, but it is not a game build this "
+                "patch can work on",
+                notes + ["Full Steam/GOG build required (the two-level one",
+                         "with the npc_rename frame)."])
+    return ("damaged",
+            "DAMAGED - the file cannot be parsed any more, so it cannot "
+            "start the game",
+            notes + ["Something cut it short or rewrote it while it was",
+                     "being written (antivirus, a crash, a full disk).",
+                     "Fix: put the pristine copy back -",
+                     "  * Mod Workshop -> Guard Key Names -> Uninstall, or",
+                     "  * TE1_Mod_Launcher.bat --revert-exe, or",
+                     "  * copy mods" + os.sep + "original" + os.sep + "exe"
+                     + os.sep + p.name + " over it by hand, or",
+                     "  * Steam: Verify integrity of game files."])
+
+
+def check_exe_report(paths):
+    """--check-exe: a printable report for files and/or folders."""
+    files = []
+    for a in paths:
+        q = Path(a)
+        try:
+            if q.is_dir():
+                files.extend(sorted(f for f in q.glob("*.exe") if f.is_file()))
+                files.extend(sorted(f for f in q.glob("*.exe.txt")
+                                    if f.is_file()))
+            else:
+                files.append(q)
+        except OSError as e:
+            say("  ! cannot look at %s: %s" % (a, e))
+    if not files:
+        say("")
+        say("  Nothing to check: pass the game executables (a renamed")
+        say("  .exe.txt copy is fine) or the game folder itself, e.g.")
+        say("")
+        say("    TE1_Mod_Launcher.bat --check-exe \"%s\"" % EXE_NAME)
+        say("    TE1_Mod_Launcher.bat --check-exe TheEscapists_eur.exe.txt")
+        return 2
+    say("")
+    rule("=")
+    say("  EXE CHECK - can this file start the game?")
+    rule("=")
+    counts = {}
+    for f in files:
+        verdict, headline, notes = gk_exe_verdict(f)
+        counts[verdict] = counts.get(verdict, 0) + 1
+        say("")
+        rule("-")
+        say("  %s" % f.name)
+        for note in notes:
+            say("    " + note)
+        say("    verdict: %s" % headline)
+    say("")
+    rule("=")
+    bad = [v for v in counts if v in ("damaged", "missing")]
+    if bad:
+        say("  BOTTOM LINE: %d file(s) are damaged or gone - see the fix"
+            % sum(counts[v] for v in bad))
+        say("  lines above. Damaged games are put right from the pristine")
+        say("  copy in mods%soriginal%sexe, or by Steam."
+            % (os.sep, os.sep))
+    else:
+        patched = counts.get("patched", 0)
+        say("  BOTTOM LINE: every file above is sound%s."
+            % (" and carries the mod" if patched else ""))
+        say("  The mod rewrites only the events of the npc_rename frame and")
+        say("  adds %d bytes - it cannot keep the game from starting."
+            % GK_GROWTH)
+        say("  If the game still does not open, the cause is outside the")
+        say("  file: a blocked program in Windows Security, a folder that is")
+        say("  missing files, or a mod-switch left on. Run this launcher's")
+        say("  --status inside the game folder, and see PATCH_NOTES.md.")
+    return 0
+
+
 # ---------------------------------------------------------- watching the game
 # Delays, in seconds. See Launcher.wait_for_game() for what they mean.
 HANDOVER = 8.0     # launcher closed, waiting for the real game to appear
 EXIT_GRACE = 2.0   # the real game closed - make sure it is really gone
 POLL_IDLE = 1.5    # how often to look while the game is running
 POLL_BUSY = 0.4    # how often to look while a delay is counting down
+MIN_GAME_RUN = 5.0  # a game that dies faster than this crashed at start-up
 
 # TheEscapists.exe (2.4 MB) is a front end; the real game is
 # TheEscapists_rus.exe / _eur.exe / _pol.exe (8 MB each). Anything that is
@@ -2032,6 +2310,53 @@ class Launcher(object):
                 problems.append("%s: %s" % (bak.name, e))
         return restored, problems
 
+    def verify_all(self):
+        """Preflight: read every file the mods touch, the way the game does.
+
+        -> (problems, lines). Empty `problems` means the game is safe to
+        start; anything else is printed before the launch is called off, so
+        the player never gets a window that flashes and dies.
+        """
+        problems, lines = [], []
+        cands = self.gk_candidates()
+        if not cands:
+            problems.append("no theescapists*.exe in %s - this is not the "
+                            "game folder" % self.game)
+        for f in cands:
+            verdict, headline, _notes = gk_exe_verdict(f)
+            lines.append("%-24s %s" % (f.name, headline))
+            if verdict in ("damaged", "missing"):
+                problems.append("%s: %s" % (f.name, headline))
+            elif self.state.get("guard_keys") and verdict == "stock":
+                problems.append("%s: the officer patch is not in the file "
+                                "(the write did not stick)" % f.name)
+        p2, l2 = verify_data(self.data)
+        problems.extend(p2)
+        lines.extend(l2)
+        return problems, lines
+
+    def explain_no_start(self):
+        """The game never showed up, or closed at once: say what to do."""
+        say("")
+        say("  Nothing is lost - the original files come back when this")
+        say("  launcher window closes. What to check:")
+        say("")
+        say("   1. Run and send:  TE1_Mod_Launcher.bat --status")
+        say("      (state + sha1 of every game exe, and whether a pristine")
+        say("       backup is on file)")
+        say("   2. Run:  TE1_Mod_Launcher.bat --verify")
+        say("      (reads Data\\*.dat and the executables the way the game")
+        say("       does and names anything damaged)")
+        say("   3. If the window flashed and vanished, the cause is usually")
+        say("      outside the files: Windows Security -> Protection history")
+        say("      (a blocked app), a cloud-synced game folder (OneDrive) or")
+        say("      a half-copied install.")
+        say("   4. The mods can be switched off one at a time in the Mod")
+        say("      Workshop; --revert-exe puts the original executables back.")
+        say("")
+        say("  Mods that were active: %s" % (", ".join(self.enabled())
+                                             or "none"))
+
     # -- applying ---------------------------------------------------------
     def files_to_touch(self):
         names = set()
@@ -2136,15 +2461,20 @@ class Launcher(object):
         names = game_exe_names(self.game)
         child = proc.pid
         game_seen = False
+        seen_at = None
+        gone_at = None
         deadline = None
         said_wait = False
         while True:
             others = running_pids(names) - {child}
             if proc.poll() is None or others:
                 # something is still up: launcher, game, or both
-                if others and not game_seen:
-                    game_seen = True
-                    say("  The game is running.")
+                if others:
+                    gone_at = None
+                    if not game_seen:
+                        game_seen = True
+                        seen_at = time.monotonic()
+                        say("  The game is running.")
                 deadline = None
                 said_wait = False
                 time.sleep(POLL_IDLE)
@@ -2153,9 +2483,22 @@ class Launcher(object):
             if deadline is None:
                 window = self.exit_grace if game_seen else self.handover
                 deadline = time.monotonic() + window
+                if game_seen:
+                    gone_at = time.monotonic()
             if time.monotonic() >= deadline:
-                if not game_seen:
+                if game_seen:
+                    ran = (gone_at or time.monotonic()) - seen_at
+                    if ran < MIN_GAME_RUN:
+                        # a window that flashes and goes away is the exact
+                        # symptom of an exe that will not start
+                        say("  The game closed again after only %.1f seconds."
+                            % ran)
+                        say("  If you did not quit it yourself, it did not"
+                            " start properly.")
+                        self.explain_no_start()
+                else:
                     say("  The game never started - restoring your files.")
+                    self.explain_no_start()
                 return
             if not game_seen and not said_wait:
                 say("  Waiting for the game to start (%.0f seconds)..."
@@ -2219,6 +2562,26 @@ def screen_launch(launcher):
         return
     say("")
     say("  Mods are active. They will be removed when the game closes.")
+    say("")
+    say("  Checking every file the game is about to load...")
+    problems, vlines = launcher.verify_all()
+    for line in vlines:
+        say("   " + line)
+    if problems:
+        # Never hand a broken folder to the game: this is what a window
+        # that flashes and vanishes looks like afterwards.
+        say("")
+        say("  ! The game would not open like this:")
+        for p in problems:
+            say("     - %s" % p)
+        say("")
+        say("  Your original files are being put back - nothing is lost.")
+        launcher.restore()
+        say("  Fix the file(s) above (Steam -> Verify integrity of game")
+        say("  files, or run --revert-exe for the executables) and try again.")
+        pause()
+        return
+    say("  All files verified - starting the game.")
     if not launcher.launch():
         launcher.restore()
         pause()
@@ -2379,6 +2742,12 @@ def find_game_dir(arg=None):
 
 def main(argv=None):
     argv = list(argv if argv is not None else sys.argv[1:])
+    # --check-exe must work anywhere: on a copy of an exe, on a renamed
+    # .txt dump, on the game folder, with or without a launcher around it.
+    if "--check-exe" in argv:
+        i = argv.index("--check-exe")
+        return check_exe_report([a for a in argv[i + 1:]
+                                 if not a.startswith("--")])
     game = None
     if "--game" in argv:
         i = argv.index("--game")
@@ -2416,16 +2785,42 @@ def main(argv=None):
     # (closed console, crash, power cut), put the game files back first.
     launcher.restore(quiet=True)
 
+    if "--verify" in argv:
+        problems, lines = launcher.verify_all()
+        say("")
+        rule("-")
+        say("  PREFLIGHT - reading every file the game loads")
+        rule("-")
+        for line in lines:
+            say("   " + line)
+        if problems:
+            say("")
+            for p in problems:
+                say("   ! %s" % p)
+            say("")
+            say("   Something here would keep the game from opening.")
+            say("   --restore puts the Data\\*.dat files back, --revert-exe")
+            say("   the executables; Steam can also verify the game files.")
+            return 1
+        say("")
+        say("   All good - nothing in Data\\ or in the executables is broken.")
+        return 0
+
     if "--status" in argv:
         say("game   : %s" % launcher.game)
+        say("data   : %s" % launcher.data)
         for key, label in MODS:
             say("%-20s %s" % (label, launcher.state.get(key)))
         cands = launcher.gk_candidates()
         if cands:
             say("")
-            say("game executables (the patch adds 112 bytes, nothing else):")
+            say("game executables (the patch adds %d bytes, nothing else):"
+                % GK_GROWTH)
+            verdicts = {}
             for f in cands:
                 size, digest = sha1_and_size(f)
+                verdict, headline, _notes = gk_exe_verdict(f)
+                verdicts[verdict] = verdicts.get(verdict, 0) + 1
                 say("  %-24s %-11s %s  sha1 %s"
                     % (f.name, gk_exe_state(f),
                        ("%10d bytes" % size) if size else "  missing   ",
@@ -2438,11 +2833,35 @@ def main(argv=None):
                        bdigest or "-",
                        ("   [%+d]" % (size - bsize))
                        if size and bsize else ""))
+                say("  check: %s" % headline)
             say("")
-            say("  Send this block when the game stops starting: if the")
-            say("  backup is pristine and the patched size is just +112 bytes,")
-            say("  the exe itself is intact and the launcher can put the")
-            say("  pristine copy back with Uninstall at any time.")
+            if any(v in ("damaged", "missing") for v in verdicts):
+                say("  ! One of the files above is damaged or gone, so the")
+                say("    game cannot start from it. Put the originals back:")
+                say("      TE1_Mod_Launcher.bat --revert-exe")
+                say("    (or Mod Workshop -> Guard Key Names -> Uninstall).")
+                say("    Steam -> Verify integrity of game files works too.")
+            else:
+                say("  Every executable above is intact%s."
+                    % (" and carries the mod" if verdicts.get("patched")
+                       else ""))
+                say("  If the game still does not start, the cause is not")
+                say("  these files - send the block above and see")
+                say("  PATCH_NOTES.md ('If the game does not start').")
+        return 0
+
+    if "--revert-exe" in argv:
+        restored, problems = launcher.gk_restore_all()
+        for name in restored:
+            say("  %s: original exe restored." % name)
+        for p in problems:
+            say("  ! could not restore %s" % p)
+        if not restored and not problems:
+            say("  No backed-up executable found - nothing to put back.")
+        if launcher.state.get("guard_keys"):
+            launcher.state["guard_keys"] = False
+            launcher.save_state()
+            say("  Guard Key Names switched off.")
         return 0
 
     if "--restore" in argv:
