@@ -74,7 +74,7 @@ if not exist "%TE1_ENGINE%" goto no_unpack
 
 rem ---- 6. hand over to the engine --------------------------------------
 echo.
-"%TE1_PY%" "%TE1_ENGINE%" --game "%TE1_GAME%."
+"%TE1_PY%" "%TE1_ENGINE%" --game "%TE1_GAME%." %*
 if not errorlevel 1 exit /b 0
 echo.
 echo   The launcher stopped with an error.
@@ -1560,6 +1560,22 @@ def gk_exe_state(path):
         return "unreadable"
 
 
+def sha1_and_size(path):
+    """-> (size, sha1 hex) or (None, None). Used by --status so a player can
+    check a suspicious exe against a known-good copy without sending 8 MB."""
+    try:
+        h = hashlib.sha1()
+        with open(str(path), "rb") as fh:
+            while True:
+                block = fh.read(1 << 20)
+                if not block:
+                    break
+                h.update(block)
+        return os.path.getsize(str(path)), h.hexdigest()
+    except OSError:
+        return None, None
+
+
 # ---------------------------------------------------------- watching the game
 # Delays, in seconds. See Launcher.wait_for_game() for what they mean.
 HANDOVER = 8.0     # launcher closed, waiting for the real game to appear
@@ -1963,6 +1979,22 @@ class Launcher(object):
             return False, log
         n_ok = 0
         for f in cands:
+            # An exe that does not parse any more (antivirus, a write that a
+            # crash or a power cut interrupted, a disk problem) is replaced
+            # by its pristine backup first: a damaged file must never keep
+            # the game from starting.
+            if gk_exe_state(f) == "unreadable":
+                bak = self.exe_orig / f.name
+                if bak.exists():
+                    try:
+                        shutil.copy2(str(bak), str(f))
+                        log.append("Guard Key Names: %s was damaged - the "
+                                   "pristine backup was put back" % f.name)
+                    except OSError as e:
+                        log.append("Guard Key Names: %s is damaged and the "
+                                   "backup could not be restored (%s)"
+                                   % (f.name, e))
+                        continue
             status, detail = gk_patch_exe(f, self.exe_orig)
             if status == "patched":
                 n_ok += 1
@@ -2388,9 +2420,29 @@ def main(argv=None):
         say("game   : %s" % launcher.game)
         for key, label in MODS:
             say("%-20s %s" % (label, launcher.state.get(key)))
-        if launcher.state.get("guard_keys"):
-            for f in launcher.gk_candidates():
-                say("%-20s %s" % ("  exe " + f.name, gk_exe_state(f)))
+        cands = launcher.gk_candidates()
+        if cands:
+            say("")
+            say("game executables (the patch adds 112 bytes, nothing else):")
+            for f in cands:
+                size, digest = sha1_and_size(f)
+                say("  %-24s %-11s %s  sha1 %s"
+                    % (f.name, gk_exe_state(f),
+                       ("%10d bytes" % size) if size else "  missing   ",
+                       digest or "-"))
+                bak = launcher.exe_orig / f.name
+                bsize, bdigest = sha1_and_size(bak)
+                say("  %-24s %-11s %s  sha1 %s%s"
+                    % ("  backup (pristine)", "yes" if bsize else "no",
+                       ("%10d bytes" % bsize) if bsize else "",
+                       bdigest or "-",
+                       ("   [%+d]" % (size - bsize))
+                       if size and bsize else ""))
+            say("")
+            say("  Send this block when the game stops starting: if the")
+            say("  backup is pristine and the patched size is just +112 bytes,")
+            say("  the exe itself is intact and the launcher can put the")
+            say("  pristine copy back with Uninstall at any time.")
         return 0
 
     if "--restore" in argv:
