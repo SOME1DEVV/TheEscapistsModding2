@@ -2170,6 +2170,8 @@ class Launcher(object):
                       "guard_keys": False}
         self.handover = HANDOVER
         self.exit_grace = EXIT_GRACE
+        # what the last launch looked like: None / "ran" / "short" / "never"
+        self.last_run = None
 
     # -- state ------------------------------------------------------------
     def load_state(self):
@@ -2488,7 +2490,8 @@ class Launcher(object):
             if time.monotonic() >= deadline:
                 if game_seen:
                     ran = (gone_at or time.monotonic()) - seen_at
-                    if ran < MIN_GAME_RUN:
+                    self.last_run = "short" if ran < MIN_GAME_RUN else "ran"
+                    if self.last_run == "short":
                         # a window that flashes and goes away is the exact
                         # symptom of an exe that will not start
                         say("  The game closed again after only %.1f seconds."
@@ -2497,6 +2500,7 @@ class Launcher(object):
                             " start properly.")
                         self.explain_no_start()
                 else:
+                    self.last_run = "never"
                     say("  The game never started - restoring your files.")
                     self.explain_no_start()
                 return
@@ -2591,6 +2595,29 @@ def screen_launch(launcher):
     say("  Game closed - restoring your original files")
     rule("-")
     launcher.restore()
+    if launcher.last_run == "never" and launcher.state.get("guard_keys"):
+        # The game did not even show up. The officer patch is the only
+        # change that touches the start of the game, so take it out as
+        # well - the player gets a working game back without doing
+        # anything, and can switch the mod on again later.
+        say("")
+        say("  The game never appeared, so the officer patch is being taken")
+        say("  out too - it is the only change that touches the game start.")
+        restored, problems = launcher.gk_restore_all()
+        for name in restored:
+            say("   %s: original exe restored." % name)
+        for p in problems:
+            say("   ! could not restore %s" % p)
+        launcher.state["guard_keys"] = False
+        launcher.save_state()
+        if restored:
+            say("")
+            say("  Guard Key Names is switched off: the next start uses the")
+            say("  original executable. Switch it back on in the Mod")
+            say("  Workshop whenever you want to try again.")
+        say("")
+        say("  If the game still does not start, run --verify and send the")
+        say("  block it prints.")
     say("")
     say("  Done. The game is unmodded again.")
     pause()
