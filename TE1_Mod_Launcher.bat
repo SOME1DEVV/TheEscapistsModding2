@@ -190,7 +190,7 @@ import time
 import zlib
 from pathlib import Path
 
-ENGINE_VERSION = "1.2"
+ENGINE_VERSION = "1.3"
 EXE_NAME = "TheEscapists.exe"
 
 # Language files the two mods touch.
@@ -598,8 +598,42 @@ def _fix_console():
 _fix_console()
 
 
+_LOG_FH = None
+_LOG_PATH = None
+
+
+def open_log(path):
+    """Everything printed also goes into mods\\launcher_log.txt.
+
+    The player can then send one small file instead of copying the console
+    (and the log survives closing the window). Rotated at 1 MB.
+    """
+    global _LOG_FH, _LOG_PATH
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists() and p.stat().st_size > (1 << 20):
+            p.unlink()
+        _LOG_FH = open(str(p), "a", encoding="utf-8", errors="replace")
+        _LOG_PATH = p
+        _LOG_FH.write("\n===== %s   engine %s   args: %s =====\n"
+                      % (time.strftime("%Y-%m-%d %H:%M:%S"), ENGINE_VERSION,
+                         " ".join(sys.argv[1:]) or "(menu)"))
+        _LOG_FH.flush()
+    except Exception:
+        _LOG_FH = None
+        _LOG_PATH = None
+    return _LOG_PATH
+
+
 def say(*a):
     print(*a, flush=True)
+    if _LOG_FH is not None:
+        try:
+            _LOG_FH.write(" ".join(str(x) for x in a) + "\n")
+            _LOG_FH.flush()
+        except Exception:
+            pass
 
 
 def rule(ch="-", n=66):
@@ -1900,31 +1934,46 @@ def short_list(names, keep=3):
     return head
 
 
-def running_pids(names):
-    """PIDs of running processes whose image name is in `names`.
+def running_processes(names):
+    """-> {pid: image name} for the processes whose name is in `names`.
 
     Windows only - everywhere else this returns nothing and the launcher
     falls back to the plain delays.
     """
     if not names or not IS_WINDOWS:
-        return set()
+        return {}
     try:
         out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              timeout=10)
         text = out.stdout.decode("utf-8", "replace")
     except Exception:
-        return set()
-    pids = set()
+        return {}
+    found = {}
     for row in csv.reader(text.splitlines()):
         if len(row) < 2:
             continue
-        if row[0].strip().lower() in names:
+        image = row[0].strip().lower()
+        if image in names:
             try:
-                pids.add(int(row[1].strip()))
+                found[int(row[1].strip())] = image
             except ValueError:
                 pass
-    return pids
+    return found
+
+
+def running_pids(names):
+    """PIDs of running processes whose image name is in `names`."""
+    return set(running_processes(names))
+
+
+def process_names(pids, names):
+    """Human names for the PIDs we saw (falls back to "a game process")."""
+    if not pids:
+        return []
+    table = running_processes(names)
+    labels = [table.get(p) for p in sorted(pids)]
+    return [l for l in labels if l]
 
 
 # ----------------------------------------------------------- Better Translate
@@ -2341,20 +2390,20 @@ class Launcher(object):
         """The game never showed up, or closed at once: say what to do."""
         say("")
         say("  Nothing is lost - the original files come back when this")
-        say("  launcher window closes. What to check:")
+        say("  launcher window closes. What to do next:")
         say("")
-        say("   1. Run and send:  TE1_Mod_Launcher.bat --status")
-        say("      (state + sha1 of every game exe, and whether a pristine")
-        say("       backup is on file)")
-        say("   2. Run:  TE1_Mod_Launcher.bat --verify")
-        say("      (reads Data\\*.dat and the executables the way the game")
-        say("       does and names anything damaged)")
-        say("   3. If the window flashed and vanished, the cause is usually")
-        say("      outside the files: Windows Security -> Protection history")
-        say("      (a blocked app), a cloud-synced game folder (OneDrive) or")
-        say("      a half-copied install.")
-        say("   4. The mods can be switched off one at a time in the Mod")
-        say("      Workshop; --revert-exe puts the original executables back.")
+        say("   1. Send me the log file: %s"
+            % (_LOG_PATH or (str(self.mods) + os.sep + "launcher_log.txt")))
+        say("      Everything on this screen, including which game process")
+        say("      started and how long it lived, is written into it.")
+        say("   2. Try the game WITHOUT the mods: Diagnostics -> 4 (put the")
+        say("      original files back), then start the game from Steam or")
+        say("      from the game folder. If it starts that way, the mod is")
+        say("      the cause - tell me exactly that.")
+        say("   3. If it does not start even unmodded, the cause is outside")
+        say("      the files: Windows Security -> Protection history (a")
+        say("      blocked app), a cloud-synced game folder (OneDrive) or a")
+        say("      half-copied install.")
         say("")
         say("  Mods that were active: %s" % (", ".join(self.enabled())
                                              or "none"))
@@ -2465,8 +2514,10 @@ class Launcher(object):
         game_seen = False
         seen_at = None
         gone_at = None
+        seen_labels = []
         deadline = None
         said_wait = False
+        front = EXE_NAME.lower()
         while True:
             others = running_pids(names) - {child}
             if proc.poll() is None or others:
@@ -2476,17 +2527,36 @@ class Launcher(object):
                     if not game_seen:
                         game_seen = True
                         seen_at = time.monotonic()
-                        say("  The game is running.")
+                        seen_labels = process_names(others, names)
+                        if seen_labels:
+                            say("  The game is running (%s, pid %s)."
+                                % (", ".join(seen_labels),
+                                   ", ".join(str(p) for p in sorted(others))))
+                        else:
+                            say("  The game is running.")
                 deadline = None
                 said_wait = False
                 time.sleep(POLL_IDLE)
                 continue
             # nothing of ours is running any more
             if deadline is None:
-                window = self.exit_grace if game_seen else self.handover
+                # Only the front end was up? Then the real game has not had
+                # its chance yet: wait the full handover, not the short
+                # exit grace, so a slow hand-over is never mistaken for a
+                # crash.
+                only_front = bool(seen_labels) and all(
+                    l == front for l in seen_labels)
+                window = self.handover if (not game_seen or only_front) \
+                    else self.exit_grace
                 deadline = time.monotonic() + window
                 if game_seen:
                     gone_at = time.monotonic()
+                diff = sorted(set(seen_labels) - {front}) if seen_labels else []
+                if diff:
+                    say("  %s closed." % ", ".join(diff))
+                elif seen_labels:
+                    say("  The front end closed - waiting for the real game"
+                        " (%.0f seconds)." % self.handover)
             if time.monotonic() >= deadline:
                 if game_seen:
                     ran = (gone_at or time.monotonic()) - seen_at
@@ -2494,6 +2564,9 @@ class Launcher(object):
                     if self.last_run == "short":
                         # a window that flashes and goes away is the exact
                         # symptom of an exe that will not start
+                        if seen_labels:
+                            say("  Watched: %s (%.1f seconds)."
+                                % (", ".join(seen_labels), ran))
                         say("  The game closed again after only %.1f seconds."
                             % ran)
                         say("  If you did not quit it yourself, it did not"
@@ -2521,7 +2594,131 @@ def header(launcher):
     say("  Mods folder : %s" % launcher.mods)
     installed = [label for m, label in MODS if launcher.state.get(m)]
     say("  Installed   : %s" % (", ".join(installed) if installed else "none"))
+    if _LOG_PATH is not None:
+        say("  Log file    : %s" % _LOG_PATH)
     rule("-")
+
+
+def print_status(launcher):
+    """The --status block: install state + one line per executable."""
+    say("game   : %s" % launcher.game)
+    say("data   : %s" % launcher.data)
+    say("engine : %s" % ENGINE_VERSION)
+    for key, label in MODS:
+        say("%-20s %s" % (label, launcher.state.get(key)))
+    cands = launcher.gk_candidates()
+    if not cands:
+        say("")
+        say("  No theescapists*.exe next to this launcher - this is not the")
+        say("  game folder. Put TE1_Mod_Launcher.bat where TheEscapists.exe")
+        say("  is and try again.")
+        return 1
+    say("")
+    say("game executables (the patch adds %d bytes, nothing else):"
+        % GK_GROWTH)
+    verdicts = {}
+    for f in cands:
+        size, digest = sha1_and_size(f)
+        verdict, headline, _notes = gk_exe_verdict(f)
+        verdicts[verdict] = verdicts.get(verdict, 0) + 1
+        say("  %-24s %-11s %s  sha1 %s"
+            % (f.name, gk_exe_state(f),
+               ("%10d bytes" % size) if size else "  missing   ",
+               digest or "-"))
+        bak = launcher.exe_orig / f.name
+        bsize, bdigest = sha1_and_size(bak)
+        say("  %-24s %-11s %s  sha1 %s%s"
+            % ("  backup (pristine)", "yes" if bsize else "no",
+               ("%10d bytes" % bsize) if bsize else "",
+               bdigest or "-",
+               ("   [%+d]" % (size - bsize)) if size and bsize else ""))
+        say("  check: %s" % headline)
+    say("")
+    if any(v in ("damaged", "missing") for v in verdicts):
+        say("  ! One of the files above is damaged or gone, so the game")
+        say("    cannot start from it. Put the originals back:")
+        say("      Diagnostics -> 4 (or TE1_Mod_Launcher.bat --revert-exe)")
+        say("    Steam -> Verify integrity of game files works too.")
+    else:
+        say("  Every executable above is intact%s."
+            % (" and carries the mod" if verdicts.get("patched") else ""))
+        say("  If the game still does not start, the cause is not in these")
+        say("  files - send me the log file (mods\\launcher_log.txt).")
+    return 0
+
+
+def print_verify(launcher):
+    """The --verify block: read every file the game loads."""
+    problems, lines = launcher.verify_all()
+    say("")
+    rule("-")
+    say("  PREFLIGHT - reading every file the game loads")
+    rule("-")
+    for line in lines:
+        say("   " + line)
+    if problems:
+        say("")
+        for p in problems:
+            say("   ! %s" % p)
+        say("")
+        say("   Something here would keep the game from opening.")
+        say("   Diagnostics -> 4 puts every original file back; Steam can")
+        say("   also verify the game files.")
+        return 1
+    say("")
+    say("   All good - nothing in Data\\ or in the executables is broken.")
+    return 0
+
+
+def screen_diagnostics(launcher):
+    """The same checks as the command line keys, as a menu."""
+    while True:
+        header(launcher)
+        say("")
+        say("  DIAGNOSTICS")
+        rule("-")
+        say("   1. Check every file the game loads (exe + Data\\*.dat)")
+        say("   2. Show the state of the game executables")
+        say("   3. Check one file (an exe or a renamed .exe.txt copy)")
+        say("   4. Put the original files back (all mods off)")
+        say("   5. Back")
+        say("")
+        c = ask("  Choose 1-5", "5")
+        if c == "1":
+            print_verify(launcher)
+        elif c == "2":
+            print_status(launcher)
+        elif c == "3":
+            say("")
+            say("  Drag the file into this window (or paste its path) and")
+            say("  press Enter. A .exe.txt copy is fine.")
+            path = ask("  File", "").strip().strip('"').strip("'")
+            if path:
+                check_exe_report([path])
+            else:
+                say("  (nothing entered)")
+        elif c == "4":
+            say("")
+            say("  This puts every Data\\*.dat file back and removes the")
+            say("  officer patch from the executables (backups are kept in")
+            say("  mods\\original).")
+            if ask("  Continue? (y/n)", "y").lower() == "y":
+                n = launcher.restore()
+                restored, problems = launcher.gk_restore_all()
+                for name in restored:
+                    say("   %s: original exe restored." % name)
+                for p in problems:
+                    say("   ! could not restore %s" % p)
+                for key, _label in MODS:
+                    launcher.state[key] = False
+                launcher.save_state()
+                say("   restored %d Data file(s); all mods switched off"
+                    % n)
+        elif c == "5":
+            return
+        else:
+            say("  -> please type 1, 2, 3, 4 or 5")
+        pause()
 
 
 def screen_main(launcher):
@@ -2530,17 +2727,20 @@ def screen_main(launcher):
         say("")
         say("   1. Launch Game With Mods")
         say("   2. Mod Workshop")
-        say("   3. Exit")
+        say("   3. Diagnostics (check files / put originals back)")
+        say("   4. Exit")
         say("")
-        c = ask("  Choose 1-3", "1")
+        c = ask("  Choose 1-4", "1")
         if c == "1":
             screen_launch(launcher)
         elif c == "2":
             screen_workshop(launcher)
         elif c == "3":
+            screen_diagnostics(launcher)
+        elif c == "4":
             return
         else:
-            say("  -> please type 1, 2 or 3")
+            say("  -> please type 1, 2, 3 or 4")
 
 
 def screen_launch(launcher):
@@ -2782,11 +2982,13 @@ def main(argv=None):
             game = argv[i + 1]
     gd = find_game_dir(game)
     if gd is None:
+        open_log(Path(os.getcwd()) / "mods" / "launcher_log.txt")
         say("")
         say("  ! %s not found." % EXE_NAME)
         say("    Put TE1_Mod_Launcher.bat in the game folder and run it there.")
         return 1
     if not (gd / "Data").exists():
+        open_log(gd / "mods" / "launcher_log.txt")
         say("")
         say("  ! No Data subfolder next to %s." % EXE_NAME)
         return 1
@@ -2794,6 +2996,7 @@ def main(argv=None):
     launcher = Launcher(gd)
     launcher.mods.mkdir(parents=True, exist_ok=True)
     launcher.load_state()
+    open_log(launcher.mods / "launcher_log.txt")
 
     def opt(name, default):
         if name in argv:
@@ -2813,69 +3016,10 @@ def main(argv=None):
     launcher.restore(quiet=True)
 
     if "--verify" in argv:
-        problems, lines = launcher.verify_all()
-        say("")
-        rule("-")
-        say("  PREFLIGHT - reading every file the game loads")
-        rule("-")
-        for line in lines:
-            say("   " + line)
-        if problems:
-            say("")
-            for p in problems:
-                say("   ! %s" % p)
-            say("")
-            say("   Something here would keep the game from opening.")
-            say("   --restore puts the Data\\*.dat files back, --revert-exe")
-            say("   the executables; Steam can also verify the game files.")
-            return 1
-        say("")
-        say("   All good - nothing in Data\\ or in the executables is broken.")
-        return 0
+        return print_verify(launcher)
 
     if "--status" in argv:
-        say("game   : %s" % launcher.game)
-        say("data   : %s" % launcher.data)
-        for key, label in MODS:
-            say("%-20s %s" % (label, launcher.state.get(key)))
-        cands = launcher.gk_candidates()
-        if cands:
-            say("")
-            say("game executables (the patch adds %d bytes, nothing else):"
-                % GK_GROWTH)
-            verdicts = {}
-            for f in cands:
-                size, digest = sha1_and_size(f)
-                verdict, headline, _notes = gk_exe_verdict(f)
-                verdicts[verdict] = verdicts.get(verdict, 0) + 1
-                say("  %-24s %-11s %s  sha1 %s"
-                    % (f.name, gk_exe_state(f),
-                       ("%10d bytes" % size) if size else "  missing   ",
-                       digest or "-"))
-                bak = launcher.exe_orig / f.name
-                bsize, bdigest = sha1_and_size(bak)
-                say("  %-24s %-11s %s  sha1 %s%s"
-                    % ("  backup (pristine)", "yes" if bsize else "no",
-                       ("%10d bytes" % bsize) if bsize else "",
-                       bdigest or "-",
-                       ("   [%+d]" % (size - bsize))
-                       if size and bsize else ""))
-                say("  check: %s" % headline)
-            say("")
-            if any(v in ("damaged", "missing") for v in verdicts):
-                say("  ! One of the files above is damaged or gone, so the")
-                say("    game cannot start from it. Put the originals back:")
-                say("      TE1_Mod_Launcher.bat --revert-exe")
-                say("    (or Mod Workshop -> Guard Key Names -> Uninstall).")
-                say("    Steam -> Verify integrity of game files works too.")
-            else:
-                say("  Every executable above is intact%s."
-                    % (" and carries the mod" if verdicts.get("patched")
-                       else ""))
-                say("  If the game still does not start, the cause is not")
-                say("  these files - send the block above and see")
-                say("  PATCH_NOTES.md ('If the game does not start').")
-        return 0
+        return print_status(launcher)
 
     if "--revert-exe" in argv:
         restored, problems = launcher.gk_restore_all()
